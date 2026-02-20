@@ -30,6 +30,7 @@ db.prepare(`
     CREATE TABLE IF NOT EXISTS students (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         aadhaar_hash TEXT UNIQUE,
+        pan_hash TEXT,
         name TEXT,
         wallet_address TEXT,
         registered_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -105,26 +106,32 @@ app.post('/login', (req, res) => {
 });
 
 // ═══════════════════════════════════════
-// STUDENT REGISTRATION (Aadhaar + Wallet)
+// STUDENT REGISTRATION (Aadhaar + PAN + Wallet)
 // ═══════════════════════════════════════
 app.post('/register-student', (req, res) => {
-    const { aadhaarNumber, name, walletAddress } = req.body;
+    const { aadhaarNumber, panNumber, name, walletAddress } = req.body;
     try {
-        // Hash Aadhaar — never store raw
+        // Hash Aadhaar and PAN — never store raw
         const aadhaarHash = '0x' + crypto.createHash('sha256').update(aadhaarNumber).digest('hex');
+        const panHash = '0x' + crypto.createHash('sha256').update(panNumber).digest('hex');
 
-        // Check if already registered
-        const existing = db.prepare('SELECT * FROM students WHERE aadhaar_hash = ?').get(aadhaarHash);
-        if (existing) {
+        // Check if either already registered
+        const existingAadhaar = db.prepare('SELECT * FROM students WHERE aadhaar_hash = ?').get(aadhaarHash);
+        if (existingAadhaar) {
             return res.status(400).json({ success: false, message: 'Aadhaar already registered' });
         }
 
-        db.prepare('INSERT INTO students (aadhaar_hash, name, wallet_address) VALUES (?, ?, ?)').run(aadhaarHash, name, walletAddress);
+        const existingWallet = db.prepare('SELECT * FROM students WHERE wallet_address = ?').get(walletAddress);
+        if (existingWallet) {
+            return res.status(400).json({ success: false, message: 'Wallet already linked to another account' });
+        }
+
+        db.prepare('INSERT INTO students (aadhaar_hash, pan_hash, name, wallet_address) VALUES (?, ?, ?, ?)').run(aadhaarHash, panHash, name, walletAddress);
         db.prepare('INSERT INTO audit_logs (action, details, performed_by) VALUES (?, ?, ?)').run(
-            'STUDENT_REGISTERED', `Student ${name} registered (wallet: ${walletAddress.substring(0, 10)}...)`, name
+            'STUDENT_REGISTERED', `Student ${name} registered with Aadhaar + PAN (wallet: ${walletAddress.substring(0, 10)}...)`, name
         );
 
-        res.json({ success: true, aadhaarHash, name, walletAddress });
+        res.json({ success: true, aadhaarHash, panHash, name, walletAddress });
     } catch (error) {
         console.error(error);
         res.status(500).json({ success: false, message: error.message });
@@ -142,6 +149,57 @@ app.post('/lookup-student', (req, res) => {
     } else {
         res.json({ found: false, aadhaarHash });
     }
+});
+
+// Verify Aadhar and PAN credentials against sandbox
+app.post('/verify-credentials', (req, res) => {
+    try {
+        const { aadhaarNumber, panNumber } = req.body;
+        
+        // Demo candidates database
+        const demoCandidates = [
+            { aadhaar: "123456789012", pan: "ABCDE1234F", name: "Rahul Sharma", walletId: "0x1234567890abcdef1234567890abcdef12345678" },
+            { aadhaar: "234567890123", pan: "BCDEF2345G", name: "Priya Patel", walletId: "0x2345678901bcdef01234567890abcdef123456ab" },
+            { aadhaar: "345678901234", pan: "CDEFG3456H", name: "Amit Kumar Singh", walletId: "0x3456789012cdef012345678901abcdef12345abc" },
+            { aadhaar: "456789012345", pan: "DEFGH4567I", name: "Neha Gupta", walletId: "0x456789012def01234567890abcdef123456abcd" },
+            { aadhaar: "567890123456", pan: "EFGHI5678J", name: "Rohan Desai", walletId: "0x56789012def01234567890abcdef123456abcde" },
+            { aadhaar: "678901234567", pan: "FGHIJ6789K", name: "Anjali Verma", walletId: "0x6789012def01234567890abcdef123456abcdef" },
+            { aadhaar: "789012345678", pan: "GHIJK7890L", name: "Vikram Reddy", walletId: "0x789012def01234567890abcdef123456abcdef1" },
+            { aadhaar: "890123456789", pan: "HIJKL8901M", name: "Divya Nair", walletId: "0x89012def01234567890abcdef123456abcdef12" },
+            { aadhaar: "901234567890", pan: "IJKLM9012N", name: "Arjun Bhat", walletId: "0x9012def01234567890abcdef123456abcdef123" },
+            { aadhaar: "012345678901", pan: "JKLMN0123O", name: "Shreya Chopra", walletId: "0xa012def01234567890abcdef123456abcdef1234" }
+        ];
+
+        const candidate = demoCandidates.find(
+            c => c.aadhaar === aadhaarNumber && c.pan === panNumber
+        );
+
+        if (candidate) {
+            return res.json({ verified: true, candidate: { name: candidate.name, aadhaar: candidate.aadhaar, pan: candidate.pan, walletId: candidate.walletId } });
+        } else {
+            return res.json({ verified: false, message: 'Credentials not found in verification database' });
+        }
+    } catch (error) {
+        console.error('Credentials verification error:', error);
+        return res.status(500).json({ verified: false, message: 'Server error during verification', error: error.message });
+    }
+});
+
+// Get all demo candidates for testing
+app.get('/demo-candidates', (req, res) => {
+    const demoCandidates = [
+        { id: 1, name: "Rahul Sharma", aadhaar: "123456789012", pan: "ABCDE1234F", walletId: "0x1234567890abcdef1234567890abcdef12345678" },
+        { id: 2, name: "Priya Patel", aadhaar: "234567890123", pan: "BCDEF2345G", walletId: "0x2345678901bcdef01234567890abcdef123456ab" },
+        { id: 3, name: "Amit Kumar Singh", aadhaar: "345678901234", pan: "CDEFG3456H", walletId: "0x3456789012cdef012345678901abcdef12345abc" },
+        { id: 4, name: "Neha Gupta", aadhaar: "456789012345", pan: "DEFGH4567I", walletId: "0x456789012def01234567890abcdef123456abcd" },
+        { id: 5, name: "Rohan Desai", aadhaar: "567890123456", pan: "EFGHI5678J", walletId: "0x56789012def01234567890abcdef123456abcde" },
+        { id: 6, name: "Anjali Verma", aadhaar: "678901234567", pan: "FGHIJ6789K", walletId: "0x6789012def01234567890abcdef123456abcdef" },
+        { id: 7, name: "Vikram Reddy", aadhaar: "789012345678", pan: "GHIJK7890L", walletId: "0x789012def01234567890abcdef123456abcdef1" },
+        { id: 8, name: "Divya Nair", aadhaar: "890123456789", pan: "HIJKL8901M", walletId: "0x89012def01234567890abcdef123456abcdef12" },
+        { id: 9, name: "Arjun Bhat", aadhaar: "901234567890", pan: "IJKLM9012N", walletId: "0x9012def01234567890abcdef123456abcdef123" },
+        { id: 10, name: "Shreya Chopra", aadhaar: "012345678901", pan: "JKLMN0123O", walletId: "0xa012def01234567890abcdef123456abcdef1234" }
+    ];
+    res.json(demoCandidates);
 });
 
 // Check student registration status by wallet
