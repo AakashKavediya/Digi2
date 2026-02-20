@@ -16,32 +16,38 @@ const StudentPortal = ({ wallet, connectWallet }) => {
     const [registering, setRegistering] = useState(false);
     const [regError, setRegError] = useState("");
 
-    // Check registration status
+    // Check registration status (by wallet or Aadhaar)
     useEffect(() => {
-        if (!wallet) { setIsRegistered(null); return; }
         const check = async () => {
+            const query = wallet ? `wallet=${wallet}` : `aadhaarNumber=${user.aadhaar}`;
             try {
-                const res = await fetch(`http://localhost:5000/student-status?wallet=${wallet}`);
+                const endpoint = wallet ? `student-status?${query}` : `lookup-student`;
+                const res = await fetch(`http://localhost:5000/${endpoint}`, {
+                    method: wallet ? 'GET' : 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: wallet ? undefined : JSON.stringify({ aadhaarNumber: user.aadhaar })
+                });
                 const data = await res.json();
-                setIsRegistered(data.registered);
+                setIsRegistered(wallet ? data.registered : data.found);
             } catch (e) {
                 setIsRegistered(false);
             }
         };
-        check();
-    }, [wallet]);
+        if (wallet || user.aadhaar) check();
+    }, [wallet, user.aadhaar]);
 
-    // Fetch certificates by wallet
+    // Fetch certificates by wallet or Aadhaar
     const fetchCerts = useCallback(async () => {
-        if (!wallet || !isRegistered) return;
+        if (!isRegistered && !user.aadhaar) return;
         try {
-            const res = await fetch(`http://localhost:5000/certificates?wallet=${wallet}`);
+            const query = wallet ? `wallet=${wallet}` : `aadhaar=${user.aadhaar}`;
+            const res = await fetch(`http://localhost:5000/certificates?${query}`);
             const data = await res.json();
             setCertificates(data || []);
         } catch (e) {
             console.error(e);
         }
-    }, [wallet, isRegistered]);
+    }, [wallet, isRegistered, user.aadhaar]);
 
     useEffect(() => {
         fetchCerts();
@@ -49,45 +55,31 @@ const StudentPortal = ({ wallet, connectWallet }) => {
         return () => clearInterval(iv);
     }, [fetchCerts]);
 
-    // Register with Aadhaar
+    // Register with Aadhaar (if not already registered via lookup)
     const handleRegister = async (e) => {
         e.preventDefault();
-        if (!wallet || aadhaarInput.length !== 12) return;
+        const effectiveAadhaar = aadhaarInput || user.aadhaar;
+        if (!effectiveAadhaar) return;
         setRegistering(true);
         setRegError("");
 
         try {
-            // 1. Hash Aadhaar in browser
-            const aadhaarBytes = new TextEncoder().encode(aadhaarInput);
-            const hashBuffer = await crypto.subtle.digest('SHA-256', aadhaarBytes);
-            const aadhaarHash = '0x' + Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-
-            // 2. Register on blockchain
-            const contract = await getContract(true);
-            const tx = await contract.registerStudent(aadhaarHash, nameInput);
-            await tx.wait();
-
-            // 3. Register on backend
             await fetch("http://localhost:5000/register-student", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ aadhaarNumber: aadhaarInput, name: nameInput, walletAddress: wallet })
+                body: JSON.stringify({ aadhaarNumber: effectiveAadhaar, name: nameInput, walletAddress: wallet || "" })
             });
-
             setIsRegistered(true);
         } catch (error) {
             console.error(error);
-            let msg = error.message || "Registration failed";
-            if (msg.includes("already registered")) msg = "This Aadhaar is already linked to a wallet.";
-            if (msg.includes("already linked")) msg = "This wallet is already linked to another Aadhaar.";
-            setRegError(msg);
+            setRegError(error.message || "Registration failed");
         } finally {
             setRegistering(false);
         }
     };
 
     // ─── No wallet connected ───
-    if (!wallet) {
+    if (!wallet && !user.aadhaar) { // Modified condition
         return (
             <div className="max-w-lg mx-auto p-8 mt-16 text-center">
                 <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-12">
@@ -106,34 +98,61 @@ const StudentPortal = ({ wallet, connectWallet }) => {
     if (isRegistered === false) {
         return (
             <div className="max-w-lg mx-auto p-8 mt-12">
-                <div className="bg-white rounded-2xl shadow-xl border border-gray-100 overflow-hidden">
-                    <div className="bg-gradient-to-r from-emerald-600 to-teal-600 px-8 py-6 text-white">
-                        <div className="flex items-center">
-                            <Fingerprint size={28} className="mr-3" />
-                            <div>
-                                <h2 className="text-xl font-bold">Aadhaar Registration</h2>
-                                <p className="text-emerald-100 text-sm">Link your identity to your wallet</p>
-                            </div>
-                        </div>
+                <div className="bg-white rounded-2xl shadow-xl border border-gray-100 p-8">
+                    <div className="text-center mb-4">
+                        <Fingerprint size={48} className="mx-auto text-emerald-400 mb-4" />
+                        <h2 className="text-xl font-bold text-gray-900 mb-2">Register with Aadhaar</h2>
+                        <p className="text-sm text-gray-500 mb-4">
+                            Link your Aadhaar to your student profile so institutions can issue certificates to you.
+                        </p>
                     </div>
-                    <form onSubmit={handleRegister} className="p-8 space-y-5">
+
+                    <form onSubmit={handleRegister} className="space-y-4 text-left">
+                        {!user.aadhaar && (
+                            <div>
+                                <label className="block text-sm font-semibold text-gray-700 mb-1.5">Aadhaar Number</label>
+                                <input
+                                    type="text"
+                                    required
+                                    maxLength={12}
+                                    className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-200 focus:border-emerald-500 text-sm font-mono tracking-widest"
+                                    placeholder="Enter 12-digit Aadhaar"
+                                    value={aadhaarInput}
+                                    onChange={(e) => setAadhaarInput(e.target.value.replace(/\\D/g, ''))}
+                                />
+                            </div>
+                        )}
+
                         <div>
                             <label className="block text-sm font-semibold text-gray-700 mb-1.5">Full Name</label>
-                            <input type="text" required className="w-full rounded-lg border border-gray-300 p-3 text-sm focus:border-emerald-500 focus:ring-2 focus:ring-emerald-200" value={nameInput} onChange={(e) => setNameInput(e.target.value)} placeholder="e.g. Rahul Sharma" />
+                            <input
+                                type="text"
+                                required
+                                className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-200 focus:border-emerald-500 text-sm"
+                                placeholder="Enter your name"
+                                value={nameInput}
+                                onChange={(e) => setNameInput(e.target.value)}
+                            />
                         </div>
-                        <div>
-                            <label className="block text-sm font-semibold text-gray-700 mb-1.5">Aadhaar Number</label>
-                            <input type="text" required maxLength={12} className="w-full rounded-lg border border-gray-300 p-3 text-sm font-mono tracking-widest focus:border-emerald-500 focus:ring-2 focus:ring-emerald-200" value={aadhaarInput} onChange={(e) => setAadhaarInput(e.target.value.replace(/\D/g, ''))} placeholder="XXXX XXXX XXXX" />
-                            <p className="text-xs text-gray-400 mt-1">Your Aadhaar will be hashed (SHA-256). Raw number is never stored.</p>
-                        </div>
-                        <div className="bg-gray-50 rounded-lg p-3 border border-gray-200">
-                            <p className="text-xs text-gray-500">Connected Wallet</p>
-                            <p className="text-sm font-mono text-gray-800 mt-0.5">{wallet}</p>
-                        </div>
-                        {regError && <div className="bg-red-50 text-red-600 text-sm p-3 rounded-lg border border-red-200">{regError}</div>}
-                        <button type="submit" disabled={registering || aadhaarInput.length < 12} className="w-full bg-gradient-to-r from-emerald-600 to-teal-600 text-white font-bold py-3 rounded-xl hover:from-emerald-700 hover:to-teal-700 shadow-lg shadow-emerald-200 transition-all flex items-center justify-center disabled:opacity-50">
-                            {registering ? <><Loader2 className="animate-spin mr-2 h-5 w-5" /> Registering on Blockchain...</> : <><UserPlus className="mr-2 h-5 w-5" /> Register Identity</>}
+
+                        {regError && (
+                            <div className="bg-red-50 text-red-600 text-sm p-3 rounded-lg border border-red-200">
+                                {regError}
+                            </div>
+                        )}
+
+                        <button
+                            type="submit"
+                            disabled={registering}
+                            className="w-full bg-gradient-to-r from-emerald-600 to-teal-600 text-white font-bold py-2.5 rounded-lg hover:from-emerald-700 hover:to-teal-700 transition-all shadow-md shadow-emerald-200 flex items-center justify-center disabled:opacity-50"
+                        >
+                            {registering ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
+                            {registering ? "Registering..." : "Register & Link Aadhaar"}
                         </button>
+
+                        <p className="text-[11px] text-gray-400 mt-2 text-center">
+                            After registration, institutions can issue certificates using your Aadhaar number.
+                        </p>
                     </form>
                 </div>
             </div>
@@ -157,7 +176,10 @@ const StudentPortal = ({ wallet, connectWallet }) => {
                 <div className="max-w-6xl mx-auto">
                     <div className="mb-8">
                         <h1 className="text-2xl font-bold text-gray-900">My Credential Wallet</h1>
-                        <p className="text-sm text-gray-500 mt-1">Certificates issued to your verified identity • {wallet.substring(0, 6)}...{wallet.substring(38)}</p>
+                        <p className="text-sm text-gray-500 mt-1">
+                            Certificates issued to your verified identity
+                            {wallet && ` • ${wallet.substring(0, 6)}...${wallet.substring(38)}`}
+                        </p>
                     </div>
 
                     {/* Update Wallet Section */}
@@ -228,10 +250,32 @@ const StudentPortal = ({ wallet, connectWallet }) => {
                                         </div>
                                     </div>
                                     <div className="bg-gray-50 px-6 py-3 border-t border-gray-100 flex justify-between items-center">
-                                        <span className="text-xs font-mono text-gray-400 truncate w-32">{cert.cert_hash ? `${cert.cert_hash.substring(0, 10)}...` : ''}</span>
-                                        <div className="flex items-center gap-2">
-                                            <button onClick={(e) => { e.stopPropagation(); setSelectedCert(cert); setShowShareModal(true); }} className="text-indigo-500 hover:text-indigo-700 p-1 hover:bg-indigo-50 rounded" title="Share"><Share2 size={16} /></button>
-                                            <button className="text-gray-400 hover:text-gray-600 p-1 hover:bg-gray-100 rounded" title="Download"><Download size={16} /></button>
+                                        <span className="text-xs font-mono text-gray-400 truncate w-32">
+                                            {cert.cert_hash ? `${cert.cert_hash.substring(0, 10)}...` : ''}
+                                        </span>
+                                        <div className="flex items-center gap-3">
+                                            {cert.cert_hash && typeof window !== 'undefined' && (
+                                                <div className="w-10 h-10 bg-white rounded-md border border-gray-200 flex items-center justify-center overflow-hidden">
+                                                    <img
+                                                        src={`https://api.qrserver.com/v1/create-qr-code/?size=80x80&data=${encodeURIComponent(`${window.location.origin}/verify?hash=${cert.cert_hash}`)}`}
+                                                        alt="Verification QR"
+                                                        className="w-full h-full"
+                                                    />
+                                                </div>
+                                            )}
+                                            <button
+                                                onClick={(e) => { e.stopPropagation(); setSelectedCert(cert); setShowShareModal(true); }}
+                                                className="text-indigo-500 hover:text-indigo-700 p-1 hover:bg-indigo-50 rounded"
+                                                title="Share"
+                                            >
+                                                <Share2 size={16} />
+                                            </button>
+                                            <button
+                                                className="text-gray-400 hover:text-gray-600 p-1 hover:bg-gray-100 rounded"
+                                                title="Download"
+                                            >
+                                                <Download size={16} />
+                                            </button>
                                         </div>
                                     </div>
                                 </div>
@@ -284,7 +328,7 @@ const StudentPortal = ({ wallet, connectWallet }) => {
                         <div className="flex flex-col items-center space-y-4 mb-6">
                             <div className="w-48 h-48 bg-white rounded-xl flex items-center justify-center border border-gray-200 shadow-inner p-2">
                                 <img
-                                    src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(`${window.location.origin}/verify?hash=${selectedCert.cert_hash}`)}`}
+                                    src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(`${window.location.origin}/verify?hash=${selectedCert.cert_hash}&id=${selectedCert.id}&issuer=${encodeURIComponent(selectedCert.issuer_name)}`)}`}
                                     alt="Verification QR Code"
                                     className="w-full h-full"
                                 />

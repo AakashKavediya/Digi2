@@ -1,12 +1,45 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
+import { useSearchParams } from "react-router-dom";
 import { getContract } from "../utils/web3";
 import { Upload, CheckCircle, XCircle, ShieldCheck, ShieldAlert } from "lucide-react";
 
 const PublicVerify = () => {
+    const [searchParams] = useSearchParams();
     const [file, setFile] = useState(null);
     const [hashInput, setHashInput] = useState("");
     const [verificationResult, setVerificationResult] = useState(null);
     const [loading, setLoading] = useState(false);
+    const autoVerified = useRef(false);
+
+    // Auto-verify if hash is in URL params
+    useEffect(() => {
+        const urlHash = searchParams.get("hash");
+        if (urlHash && !autoVerified.current) {
+            autoVerified.current = true;
+            setHashInput(urlHash);
+            // Auto-trigger verification
+            (async () => {
+                setLoading(true);
+                try {
+                    const blockchainData = await verifyMetadata(urlHash);
+                    if (blockchainData) {
+                        setVerificationResult({
+                            status: blockchainData.revoked ? "REVOKED" : "VALID",
+                            ...blockchainData,
+                            hash: urlHash
+                        });
+                    } else {
+                        setVerificationResult({ status: "INVALID", hash: urlHash });
+                    }
+                } catch (e) {
+                    console.error(e);
+                    setVerificationResult({ status: "INVALID", hash: urlHash });
+                } finally {
+                    setLoading(false);
+                }
+            })();
+        }
+    }, [searchParams]);
 
     const handleFileChange = (e) => {
         if (e.target.files[0]) {
@@ -67,13 +100,32 @@ const PublicVerify = () => {
             }
 
             console.log("Verifying Hash:", hashToVerify);
+
+            // 1. Check Blockchain
             const blockchainData = await verifyMetadata(hashToVerify);
+
+            // 2. Check Backend for rich metadata
+            let backendData = null;
+            try {
+                const bRes = await fetch("http://localhost:5000/verify-check", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ hash: hashToVerify })
+                });
+                const bData = await bRes.json();
+                if (bData.exists) backendData = bData.cert;
+            } catch (e) {
+                console.warn("Backend metadata fetch failed", e);
+            }
 
             if (blockchainData) {
                 setVerificationResult({
                     status: blockchainData.revoked ? "REVOKED" : "VALID",
                     ...blockchainData,
-                    hash: hashToVerify
+                    hash: hashToVerify,
+                    // Use backend data if available for rich display
+                    courseTitle: backendData?.course_title,
+                    issuerName: backendData?.issuer_name || blockchainData.issuer
                 });
             } else {
                 setVerificationResult({
@@ -155,8 +207,8 @@ const PublicVerify = () => {
                 {/* Results Section */}
                 {verificationResult && (
                     <div className={`p-6 border-t ${verificationResult.status === 'VALID' ? 'bg-green-50 border-green-200' :
-                            verificationResult.status === 'REVOKED' ? 'bg-yellow-50 border-yellow-200' :
-                                'bg-red-50 border-red-200'
+                        verificationResult.status === 'REVOKED' ? 'bg-yellow-50 border-yellow-200' :
+                            'bg-red-50 border-red-200'
                         }`}>
                         <div className="flex items-center gap-4 mb-4">
                             {verificationResult.status === 'VALID' && <ShieldCheck className="w-10 h-10 text-green-600" />}
@@ -165,8 +217,8 @@ const PublicVerify = () => {
 
                             <div>
                                 <h3 className={`text-xl font-bold ${verificationResult.status === 'VALID' ? 'text-green-800' :
-                                        verificationResult.status === 'REVOKED' ? 'text-yellow-800' :
-                                            'text-red-800'
+                                    verificationResult.status === 'REVOKED' ? 'text-yellow-800' :
+                                        'text-red-800'
                                     }`}>
                                     Certificate is {verificationResult.status}
                                 </h3>
@@ -184,19 +236,19 @@ const PublicVerify = () => {
                                     <span className="font-semibold">Student Name:</span>
                                     <span>{verificationResult.name}</span>
                                 </div>
+                                {verificationResult.courseTitle && (
+                                    <div className="flex justify-between">
+                                        <span className="font-semibold">Course:</span>
+                                        <span>{verificationResult.courseTitle}</span>
+                                    </div>
+                                )}
                                 <div className="flex justify-between">
                                     <span className="font-semibold">Issuer:</span>
-                                    <span className="font-mono text-xs" title={verificationResult.issuer}>
-                                        {verificationResult.issuer.substring(0, 10)}...{verificationResult.issuer.substring(38)}
-                                    </span>
-                                </div>
-                                <div className="flex justify-between">
-                                    <span className="font-semibold">Issued On:</span>
-                                    <span>{new Date(verificationResult.timestamp).toLocaleDateString()}</span>
+                                    <span>{verificationResult.issuerName}</span>
                                 </div>
                                 <div className="pt-2 border-t border-gray-200 mt-2">
                                     <span className="font-semibold block mb-1">Hash:</span>
-                                    <span className="font-mono text-xs break-all text-gray-500 block">
+                                    <span className="font-mono text-[10px] break-all text-gray-400 block p-2 bg-gray-50 rounded">
                                         {verificationResult.hash}
                                     </span>
                                 </div>

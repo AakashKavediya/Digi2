@@ -24,8 +24,13 @@ const Header = ({ toggleSidebar }) => {
 
     const connectWallet = async () => {
         if (window.ethereum) {
-            const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
-            setWallet(accounts[0]);
+            try {
+                const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+                setWallet(accounts[0]);
+            } catch (err) {
+                console.warn('Failed to request accounts from MetaMask:', err);
+                alert('MetaMask cannot reach the local RPC (Hardhat). The admin UI will continue in read-only/demo mode.');
+            }
         }
     };
 

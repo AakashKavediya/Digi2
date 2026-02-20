@@ -5,6 +5,7 @@ import { ethers } from "ethers";
 
 const UniversityWhitelist = () => {
     const [universities, setUniversities] = useState([]);
+    const [requests, setRequests] = useState([]);
     const [isModalOpen, setIsModalOpen] = useState(false);
     const [formData, setFormData] = useState({ name: "", website: "", wallet_address: "" });
     const [loading, setLoading] = useState(false);
@@ -14,7 +15,14 @@ const UniversityWhitelist = () => {
 
     useEffect(() => {
         fetchUniversities();
+        fetchRequests();
         checkAdminStatus();
+
+        if (window.ethereum) {
+            const handleAccounts = () => checkAdminStatus();
+            window.ethereum.on('accountsChanged', handleAccounts);
+            return () => window.ethereum.removeListener('accountsChanged', handleAccounts);
+        }
     }, []);
 
     const fetchUniversities = async () => {
@@ -24,6 +32,16 @@ const UniversityWhitelist = () => {
             setUniversities(data);
         } catch (error) {
             console.error("Failed to fetch universities", error);
+        }
+    };
+
+    const fetchRequests = async () => {
+        try {
+            const res = await fetch('http://localhost:5000/admin/requests');
+            const data = await res.json();
+            setRequests(data || []);
+        } catch (e) {
+            console.error('Failed to fetch requests', e);
         }
     };
 
@@ -84,7 +102,10 @@ const UniversityWhitelist = () => {
         } catch (error) {
             console.error(error);
             let msg = error.message || "Transaction failed";
-            if (msg.includes("AccessControl")) msg = "Your wallet does NOT have ADMIN_ROLE. Switch MetaMask to Account #0 (deployer).";
+            if (error.data && error.data.message) msg = error.data.message;
+            if (msg.includes("reverted")) {
+                msg = "Transaction Reverted: Your wallet does NOT have ADMIN_ROLE. Switch MetaMask to Account #0 (deployer).";
+            }
             setTxStatus({ type: 'error', msg });
         } finally {
             setLoading(false);
@@ -124,13 +145,7 @@ const UniversityWhitelist = () => {
                             <Wallet size={16} className="mr-2" /> Connect Admin Wallet
                         </button>
                     )}
-                    <button
-                        onClick={() => setIsModalOpen(true)}
-                        disabled={!isAdmin}
-                        className="flex items-center bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                        <Plus size={18} className="mr-2" /> Add Institution
-                    </button>
+                    <div className="text-sm text-slate-500">Approve or reject incoming institution requests below.</div>
                 </div>
             </div>
 
@@ -163,66 +178,75 @@ const UniversityWhitelist = () => {
             )}
 
             {/* Table */}
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                <table className="min-w-full divide-y divide-slate-200">
-                    <thead className="bg-slate-50">
-                        <tr>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase">Institution Name</th>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase">Wallet Address</th>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase">Status</th>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase">Date Added</th>
-                            <th className="px-6 py-3 text-center text-xs font-medium text-slate-500 uppercase">Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody className="bg-white divide-y divide-slate-200">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+                    <h3 className="text-sm font-semibold mb-3">Pending Institution Requests</h3>
+                    <div className="space-y-3">
+                        {requests.filter(r => r.status === 'PENDING').map((r) => (
+                            <div key={r.id} className="p-3 border rounded-lg flex items-center justify-between">
+                                <div>
+                                    <div className="text-sm font-medium">{r.name}</div>
+                                    <div className="text-xs font-mono text-slate-500 mt-1">{r.wallet_address}</div>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <button onClick={async () => {
+                                        if (!confirm(`Approve ${r.name}? This will grant ISSUER_ROLE on-chain.`)) return;
+                                        try {
+                                            const contract = await getContract(true);
+                                            const tx = await contract.grantIssuerRole(r.wallet_address);
+                                            await tx.wait();
+                                            await fetch('http://localhost:5000/admin/requests/approve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: r.id }) });
+                                            fetchUniversities(); fetchRequests();
+                                            setTxStatus({ type: 'success', msg: `${r.name} approved and role granted.` });
+                                        } catch (e) {
+                                            console.error(e);
+                                            let errorMsg = e.message;
+                                            if (e.data && e.data.message) errorMsg = e.data.message;
+                                            if (errorMsg.includes("reverted")) {
+                                                errorMsg = "Transaction Reverted: Only the Admin (Account #0) can grant roles.";
+                                            }
+                                            setTxStatus({ type: 'error', msg: errorMsg });
+                                        }
+                                    }}
+                                        disabled={isAdmin !== true}
+                                        className={`px-3 py-1 rounded text-sm transition-opacity ${isAdmin === true ? 'bg-green-600 text-white' : 'bg-gray-300 text-gray-500 cursor-not-allowed opacity-50'}`}
+                                    >Approve</button>
+                                    <button onClick={async () => {
+                                        if (!confirm(`Reject ${r.name}?`)) return;
+                                        await fetch('http://localhost:5000/admin/requests/reject', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: r.id }) });
+                                        fetchRequests();
+                                    }}
+                                        disabled={isAdmin !== true}
+                                        className={`px-3 py-1 rounded text-sm border transition-opacity ${isAdmin === true ? 'bg-red-50 text-red-600 border-red-100' : 'bg-gray-50 text-gray-400 border-gray-200 cursor-not-allowed opacity-50'}`}
+                                    >Reject</button>
+                                </div>
+                            </div>
+                        ))}
+                        {requests.filter(r => r.status === 'PENDING').length === 0 && (
+                            <div className="text-xs text-slate-500">No pending requests.</div>
+                        )}
+                    </div>
+                </div>
+
+                <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+                    <h3 className="text-sm font-semibold mb-3">Whitelisted Institutions</h3>
+                    <div className="space-y-3">
                         {universities.map((uni) => (
-                            <tr key={uni.id} className="hover:bg-slate-50 transition-colors">
-                                <td className="px-6 py-4 whitespace-nowrap">
-                                    <div className="text-sm font-medium text-slate-900">{uni.name}</div>
-                                    <div className="text-sm text-slate-500 flex items-center mt-1">
-                                        <ExternalLink size={12} className="mr-1" />
-                                        {uni.website}
-                                    </div>
-                                </td>
-                                <td className="px-6 py-4 whitespace-nowrap">
-                                    <span className="text-xs font-mono text-slate-500 bg-slate-50 px-2 py-1 rounded">{uni.wallet_address}</span>
-                                </td>
-                                <td className="px-6 py-4 whitespace-nowrap">
-                                    {uni.status === 'VERIFIED' ? (
-                                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
-                                            <ShieldCheck size={12} className="mr-1" /> Verified
-                                        </span>
-                                    ) : (
-                                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800">
-                                            <ShieldAlert size={12} className="mr-1" /> Revoked
-                                        </span>
-                                    )}
-                                </td>
-                                <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">
-                                    {new Date(uni.added_on).toLocaleDateString()}
-                                </td>
-                                <td className="px-6 py-4 whitespace-nowrap text-center">
-                                    {uni.status === 'VERIFIED' && (
-                                        <button
-                                            onClick={() => handleRevoke(uni)}
-                                            disabled={!isAdmin}
-                                            className="text-red-500 hover:text-red-700 font-medium text-sm border border-red-200 hover:bg-red-50 px-3 py-1 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                        >
-                                            Revoke
-                                        </button>
-                                    )}
-                                </td>
-                            </tr>
+                            <div key={uni.id} className="p-3 border rounded-lg flex items-center justify-between">
+                                <div>
+                                    <div className="text-sm font-medium">{uni.name}</div>
+                                    <div className="text-xs font-mono text-slate-500 mt-1">{uni.wallet_address}</div>
+                                </div>
+                                <div>
+                                    {uni.status === 'VERIFIED' ? (<span className="text-xs text-green-700">Verified</span>) : (<span className="text-xs text-red-700">Revoked</span>)}
+                                </div>
+                            </div>
                         ))}
                         {universities.length === 0 && (
-                            <tr>
-                                <td colSpan="5" className="px-6 py-8 text-center text-slate-500">
-                                    No institutions whitelisted yet. Add one to grant ISSUER_ROLE.
-                                </td>
-                            </tr>
+                            <div className="text-xs text-slate-500">No institutions whitelisted yet.</div>
                         )}
-                    </tbody>
-                </table>
+                    </div>
+                </div>
             </div>
 
             {/* Add Institution Modal */}

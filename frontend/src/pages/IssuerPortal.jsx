@@ -1,10 +1,10 @@
 import { useState, useEffect } from "react";
-import { Upload, FileText, Loader2, CheckCircle, Shield, Hash, CreditCard, AlertTriangle, Search, UserCheck, Building } from "lucide-react";
+import { Upload, FileText, Loader2, CheckCircle, Shield, Hash, CreditCard, AlertTriangle, Search, UserCheck, Building, Wallet } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 import { getContract } from "../utils/web3";
 import { ethers } from "ethers";
 
-const IssuerPortal = ({ wallet, connectWallet }) => {
+const IssuerPortal = ({ wallet, connectWallet, connectedMetaMask }) => {
     const { user } = useAuth();
     const [file, setFile] = useState(null);
     const [aadhaarNumber, setAadhaarNumber] = useState("");
@@ -15,21 +15,44 @@ const IssuerPortal = ({ wallet, connectWallet }) => {
     const [hasIssuerRole, setHasIssuerRole] = useState(null); // null = checking, true/false = result
     const [studentLookup, setStudentLookup] = useState(null); // { found, name, wallet, aadhaarHash }
     const [lookingUp, setLookingUp] = useState(false);
+    const [manualInstWallet, setManualInstWallet] = useState(wallet || ""); // For manual entry in registration
 
     // Check if connected wallet has ISSUER_ROLE
     useEffect(() => {
+        let isMounted = true;
         const checkRole = async () => {
             if (!wallet) { setHasIssuerRole(null); return; }
             try {
                 const contract = await getContract(false);
                 const result = await contract.isIssuer(wallet);
-                setHasIssuerRole(result);
+                if (isMounted) setHasIssuerRole(result);
             } catch (e) {
                 console.error("Role check failed:", e);
-                setHasIssuerRole(false);
+                if (isMounted) setHasIssuerRole(false);
             }
         };
         checkRole();
+        return () => { isMounted = false; };
+    }, [wallet]);
+
+    // Check registration / request status from backend
+    const [instName, setInstName] = useState("");
+    const [requestStatus, setRequestStatus] = useState(null); // PENDING / APPROVED / REJECTED / NOT_FOUND
+
+    useEffect(() => {
+        const fetchStatus = async () => {
+            if (!wallet) { setRequestStatus(null); return; }
+            try {
+                const res = await fetch(`http://localhost:5000/institutions/status?wallet=${wallet}`);
+                const data = await res.json();
+                if (data.status) setRequestStatus(data.status);
+            } catch (e) {
+                setRequestStatus(null);
+            }
+        };
+        fetchStatus();
+        const iv = setInterval(fetchStatus, 5000);
+        return () => clearInterval(iv);
     }, [wallet]);
 
     // Lookup student by Aadhaar
@@ -79,90 +102,148 @@ const IssuerPortal = ({ wallet, connectWallet }) => {
             console.log("Student Wallet:", studentLookup.student.wallet);
             console.log("Aadhaar Hash:", aadhaarHash);
 
-            // Step 3: Blockchain TX
-            const contract = await getContract(true);
-            const tx = await contract.issueCertificate(
-                hashHex,
-                studentLookup.student.wallet,
-                aadhaarHash,
-                studentLookup.student.name,
-                courseTitle,
-                "ipfs://pending"
-            );
-            const receipt = await tx.wait();
-
-            // Step 4: Save to backend
+            // Step 3: On-chain + DB (server-signed) to bypass MetaMask UI issues
+            // This uses Hardhat Account #1 on the backend, so no MetaMask popup/confirm is needed.
             const formData = new FormData();
             formData.append("file", file);
             formData.append("studentName", studentLookup.student.name);
             formData.append("studentWallet", studentLookup.student.wallet);
-            formData.append("aadhaarHash", aadhaarHash);
+            formData.append("aadhaarNumber", aadhaarNumber);
             formData.append("courseTitle", courseTitle);
             formData.append("issuerName", user.name || "Mumbai University");
-            formData.append("issuerWallet", wallet);
-            formData.append("txHash", tx.hash);
-            formData.append("blockNumber", receipt.blockNumber.toString());
 
-            await fetch("http://localhost:5000/issue-certificate", { method: "POST", body: formData });
+            const resp = await fetch("http://localhost:5000/issue-certificate-onchain", {
+                method: "POST",
+                body: formData
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.success) {
+                throw new Error(data.message || "Issuance failed");
+            }
 
             setResult({
                 success: true,
-                txHash: tx.hash,
-                blockNumber: receipt.blockNumber,
-                hash: hashHex,
+                txHash: data.txHash,
+                blockNumber: data.blockNumber,
+                hash: data.certHash || hashHex,
                 studentName: studentLookup.student.name,
                 courseTitle
             });
         } catch (error) {
             console.error("Issuance Error:", error);
             let msg = error.message || "Transaction failed";
-            if (msg.includes("Not authorized") || msg.includes("ISSUER_ROLE")) {
-                msg = "Your wallet does not have ISSUER_ROLE. Ask Admin (Account #0) to whitelist your wallet.";
-            } else if (msg.includes("already exists")) {
+            
+            // Handle specific error cases
+            if (error.code === 4001) {
+                msg = "Transaction rejected by user. Please try again and click 'Confirm' in MetaMask.";
+            } else if (error.code === -32603 || error.message?.includes("user rejected")) {
+                msg = "Transaction was cancelled. Please try again and confirm in MetaMask.";
+            } else if (msg.includes("Not authorized") || msg.includes("ISSUER_ROLE") || msg.includes("AccessControl")) {
+                msg = "Your wallet does not have ISSUER_ROLE. Contact admin to whitelist your wallet (0x0d9A...c1127).";
+            } else if (msg.includes("already exists") || msg.includes("Certificate hash already exists")) {
                 msg = "A certificate with this exact file hash already exists on the blockchain.";
-            } else if (msg.includes("Invalid student")) {
-                msg = "Invalid student wallet address. Ensure the student has registered.";
+            } else if (msg.includes("Invalid student") || msg.includes("Invalid student wallet")) {
+                msg = "Invalid student wallet address. Ensure the student has registered with their Aadhaar.";
+            } else if (msg.includes("MetaMask") || msg.includes("wallet")) {
+                // Keep MetaMask-related errors as-is
+            } else if (error.reason) {
+                msg = error.reason;
             }
+            
             setResult({ success: false, error: msg });
         } finally {
             setLoading(false);
         }
     };
 
-    // ─── Wallet not connected ───
-    if (!wallet) {
+    // ─── Main View Logic ───
+    // If not approved and not known to have issuer role, show registration/status
+    if (hasIssuerRole === false || (requestStatus !== 'APPROVED' && requestStatus !== 'VERIFIED' && hasIssuerRole !== true)) {
         return (
-            <div className="max-w-lg mx-auto p-8 mt-16 text-center">
-                <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-12">
-                    <Building size={48} className="mx-auto text-indigo-400 mb-4" />
-                    <h2 className="text-xl font-bold text-gray-900 mb-2">Connect Institution Wallet</h2>
-                    <p className="text-sm text-gray-500 mb-6">Connect MetaMask Account #1 to issue certificates.</p>
-                    <button onClick={connectWallet} className="bg-gradient-to-r from-indigo-600 to-blue-600 text-white font-bold py-3 px-8 rounded-xl hover:from-indigo-700 hover:to-blue-700 transition-all shadow-lg shadow-indigo-200">
-                        Connect MetaMask
-                    </button>
-                </div>
-            </div>
-        );
-    }
+            <div className="max-w-xl mx-auto p-8 mt-16">
+                <div className="bg-white rounded-2xl shadow-lg border border-indigo-100 p-8">
+                    <Building size={40} className="mx-auto text-indigo-400 mb-4" />
+                    <h2 className="text-xl font-bold text-gray-900 mb-2 text-center">Institution Registration</h2>
+                    <p className="text-sm text-gray-500 mb-6 text-center">Register your institution to start issuing blockchain-verified credentials.</p>
 
-    // ─── No ISSUER_ROLE ───
-    if (hasIssuerRole === false) {
-        return (
-            <div className="max-w-lg mx-auto p-8 mt-16 text-center">
-                <div className="bg-white rounded-2xl shadow-lg border border-red-100 p-12">
-                    <AlertTriangle size={48} className="mx-auto text-red-400 mb-4" />
-                    <h2 className="text-xl font-bold text-gray-900 mb-2">Not Authorized as Issuer</h2>
-                    <p className="text-sm text-gray-500 mb-4">Your wallet does not have <code className="bg-red-50 px-2 py-1 rounded text-red-600 text-xs font-mono">ISSUER_ROLE</code> on the blockchain.</p>
-                    <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 text-left text-sm text-amber-800">
-                        <p className="font-semibold mb-1">How to fix:</p>
-                        <ol className="list-decimal list-inside space-y-1 text-xs">
-                            <li>Login as <strong>Admin</strong> (admin@demo.com)</li>
-                            <li>Switch MetaMask to <strong>Account #0</strong> (deployer)</li>
-                            <li>Go to <strong>University Whitelist</strong></li>
-                            <li>Add your Institution wallet: <code className="bg-white px-1 rounded">{wallet.substring(0, 10)}...{wallet.substring(38)}</code></li>
-                        </ol>
+                    {/* Registration / Request Form */}
+                    <div className="space-y-4">
+                        <div>
+                            <label className="block text-sm font-semibold text-gray-700 mb-2">Institution Name</label>
+                            <input type="text" value={instName} onChange={(e) => setInstName(e.target.value)} className="w-full rounded-lg border border-gray-300 p-3 text-sm focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500" placeholder="e.g. Mumbai University" />
+                        </div>
+
+                        <div>
+                            <div className="flex justify-between items-center mb-2">
+                                <label className="block text-sm font-semibold text-gray-700">Wallet Address</label>
+                                <span className="text-[10px] text-gray-400 uppercase tracking-widest font-bold text-right">Manual entry or connect MetaMask</span>
+                            </div>
+                            <div className="flex gap-2">
+                                <input
+                                    type="text"
+                                    value={manualInstWallet}
+                                    onChange={(e) => setManualInstWallet(e.target.value)}
+                                    className="flex-1 rounded-lg border border-gray-300 p-3 text-sm font-mono focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500"
+                                    placeholder="0x..."
+                                />
+                                <button onClick={connectWallet} className="px-3 py-2 bg-slate-100 hover:bg-slate-200 rounded-lg text-xs font-semibold transition-colors border border-slate-200 flex items-center gap-1">
+                                    <Wallet size={14} /> Link
+                                </button>
+                            </div>
+                            {wallet && <p className="text-[10px] text-indigo-500 mt-2 font-medium">Connected: {wallet}</p>}
+                        </div>
+
+                        <div className="flex flex-col gap-3 pt-2">
+                            <button
+                                onClick={async () => {
+                                    if (!instName || !manualInstWallet) return alert('Enter institution name and wallet address');
+                                    try {
+                                        setLoading(true);
+                                        const res = await fetch('http://localhost:5000/institutions/request', {
+                                            method: 'POST',
+                                            headers: { 'Content-Type': 'application/json' },
+                                            body: JSON.stringify({ name: instName, wallet_address: manualInstWallet })
+                                        });
+                                        const data = await res.json();
+                                        if (data.success) {
+                                            setRequestStatus('PENDING');
+                                            alert("Approval request sent to Admin!");
+                                        } else {
+                                            alert(data.message || "Failed to submit request");
+                                        }
+                                    } catch (e) {
+                                        console.error(e);
+                                        alert('Failed to submit request');
+                                    } finally {
+                                        setLoading(false);
+                                    }
+                                }}
+                                disabled={loading || requestStatus === 'PENDING'}
+                                className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 rounded-xl transition-all shadow-md shadow-indigo-100 flex items-center justify-center gap-2 disabled:opacity-50"
+                            >
+                                {loading ? <Loader2 size={18} className="animate-spin" /> : requestStatus === 'PENDING' ? "Request Pending Approval" : "Request Approval from MeitY"}
+                            </button>
+                        </div>
+
+                        {requestStatus === 'PENDING' && (
+                            <div className="mt-4 p-4 rounded-xl border border-amber-200 bg-amber-50 text-center animate-pulse">
+                                <p className="text-xs uppercase font-bold tracking-widest text-amber-800 mb-1">Awaiting Admin Approval</p>
+                                <p className="text-xs text-amber-700">MeitY admin will review and whitelist your wallet soon.</p>
+                            </div>
+                        )}
+
+                        {requestStatus === 'REJECTED' && (
+                            <div className="mt-4 p-4 rounded-xl border border-red-200 bg-red-50 text-center">
+                                <p className="text-xs uppercase font-bold tracking-widest text-red-800 mb-1">Request Rejected</p>
+                                <p className="text-xs text-red-700">Please contact support or try a different wallet.</p>
+                            </div>
+                        )}
                     </div>
-                    <p className="text-xs text-gray-400 mt-4">Connected wallet: {wallet}</p>
+
+                    <div className="mt-8 p-4 bg-blue-50 rounded-xl border border-blue-100 flex items-start">
+                        <Shield size={18} className="text-blue-500 mr-3 mt-0.5 flex-shrink-0" />
+                        <p className="text-xs text-blue-700 leading-relaxed">Only whitelisted institutions can anchor academic credentials on the blockchain.</p>
+                    </div>
                 </div>
             </div>
         );
@@ -179,14 +260,25 @@ const IssuerPortal = ({ wallet, connectWallet }) => {
     }
 
     // ─── Main Issuer Form ───
+    const isMismatch = wallet && connectedMetaMask && wallet.toLowerCase() !== connectedMetaMask.toLowerCase();
+
     return (
         <div className="max-w-4xl mx-auto p-6 mt-4">
+            {isMismatch && wallet && connectedMetaMask && (
+                <div className="mb-4 p-3 bg-orange-50 border border-orange-200 rounded-xl flex items-center text-orange-800 text-sm shadow-sm animate-pulse">
+                    <AlertTriangle size={16} className="mr-2 text-orange-600" />
+                    <span>MetaMask is on <b>{connectedMetaMask.substring(0, 10)}...</b>, but you are logged in as <b>{wallet.substring(0, 10)}...</b>. Transactions will fail.</span>
+                </div>
+            )}
             <div className="bg-white rounded-2xl shadow-xl overflow-hidden border border-gray-100">
                 <div className="bg-gradient-to-r from-indigo-600 to-blue-600 px-8 py-6 text-white">
                     <div className="flex justify-between items-center">
                         <div>
                             <h1 className="text-2xl font-bold">Issue Certificate</h1>
-                            <p className="text-indigo-100 text-sm mt-1">Issuing as: {user.name} • {wallet.substring(0, 6)}...{wallet.substring(38)}</p>
+                            <p className="text-indigo-100 text-sm mt-1">
+                                Issuing as: {user.name}
+                                {wallet && ` • ${wallet.substring(0, 6)}...${wallet.substring(38)}`}
+                            </p>
                         </div>
                         <div className="bg-white/20 backdrop-blur-sm p-3 rounded-xl flex items-center gap-2">
                             <CheckCircle size={18} />
@@ -280,17 +372,27 @@ const IssuerPortal = ({ wallet, connectWallet }) => {
                             </div>
 
                             {/* Submit */}
-                            <button
-                                type="submit"
-                                disabled={loading || !file || !studentLookup?.found}
-                                className="w-full bg-gradient-to-r from-indigo-600 to-blue-600 text-white font-bold py-3.5 px-6 rounded-xl hover:from-indigo-700 hover:to-blue-700 transition-all flex items-center justify-center shadow-lg shadow-indigo-200 disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                                {loading ? (
-                                    <><Loader2 className="animate-spin mr-2 h-5 w-5" /> Anchoring on Blockchain...</>
-                                ) : (
-                                    <><Shield className="mr-2 h-5 w-5" /> Issue & Anchor Certificate</>
+                            <div className="space-y-3">
+                                <button
+                                    type="submit"
+                                    disabled={loading || !file || !studentLookup?.found}
+                                    className="w-full bg-gradient-to-r from-indigo-600 to-blue-600 text-white font-bold py-3.5 px-6 rounded-xl hover:from-indigo-700 hover:to-blue-700 transition-all flex items-center justify-center shadow-lg shadow-indigo-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    {loading ? (
+                                        <><Loader2 className="animate-spin mr-2 h-5 w-5" /> Anchoring on Blockchain...</>
+                                    ) : (
+                                        <><Shield className="mr-2 h-5 w-5" /> Issue & Anchor Certificate</>
+                                    )}
+                                </button>
+                                {loading && (
+                                    <div className="text-center text-xs text-gray-500 bg-blue-50 p-3 rounded-lg border border-blue-100">
+                                        <p className="font-semibold text-blue-800 mb-1">MetaMask Transaction Pending</p>
+                                        <p className="text-blue-600">1. Click <strong>"Review alert"</strong> in MetaMask popup</p>
+                                        <p className="text-blue-600">2. Review transaction details</p>
+                                        <p className="text-blue-600">3. Click <strong>"Confirm"</strong> to complete</p>
+                                    </div>
                                 )}
-                            </button>
+                            </div>
                         </form>
                     ) : result.success ? (
                         <div className="text-center py-8">

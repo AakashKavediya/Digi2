@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Routes, Route, Navigate } from "react-router-dom";
+import { Routes, Route, Navigate, useLocation } from "react-router-dom";
 import { useAuth } from "./context/AuthContext";
 import StudentPortal from "./pages/StudentPortal";
 import VerifierPortal from "./pages/VerifierPortal";
@@ -9,6 +9,7 @@ import AdminDashboard from "./pages/admin/Dashboard";
 import UniversityWhitelist from "./pages/admin/UniversityWhitelist";
 import RevocationLogs from "./pages/admin/RevocationLogs";
 import SystemAudit from "./pages/admin/SystemAudit";
+import PublicVerify from "./pages/PublicVerify";
 import Login from "./pages/Login";
 import { Shield, LogOut, Wallet, Building, GraduationCap, Search, Settings } from "lucide-react";
 
@@ -29,14 +30,26 @@ function App() {
     }, []);
 
     const connectWallet = async () => {
-        if (!window.ethereum) return alert("Please install MetaMask!");
+        if (!window.ethereum) return;
         try {
             const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
             setWallet(accounts[0]);
         } catch (error) {
-            console.error("Wallet connection failed", error);
+            console.warn("Wallet connection failed", error);
+            // Silently fail, UI already shows fallback session status
+            setWallet(null);
         }
     };
+
+    // Public /verify route — accessible without login
+    const location = useLocation();
+    if (location.pathname === '/verify') {
+        return (
+            <Routes>
+                <Route path="/verify" element={<PublicVerify />} />
+            </Routes>
+        );
+    }
 
     if (!user) return <Login />;
 
@@ -55,6 +68,10 @@ function App() {
         );
     }
 
+    // Determine effective wallet (MetaMask or Session)
+    const effectiveWallet = wallet || user?.walletAddress;
+
+    // Header config
     const roleConfig = {
         student: { label: "Student Wallet", color: "bg-emerald-50 text-emerald-700 border-emerald-200", icon: <GraduationCap size={14} /> },
         verifier: { label: "Verifier Portal", color: "bg-amber-50 text-amber-700 border-amber-200", icon: <Search size={14} /> },
@@ -81,11 +98,12 @@ function App() {
                                 {config.icon} {config.label}
                             </span>
 
-                            {wallet ? (
-                                <div className="flex items-center gap-2 bg-indigo-50 px-3 py-1.5 rounded-lg border border-indigo-100">
-                                    <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
-                                    <span className="text-xs font-mono text-indigo-700">
-                                        {wallet.substring(0, 6)}...{wallet.substring(38)}
+                            {effectiveWallet ? (
+                                <div className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border ${wallet ? 'bg-indigo-50 border-indigo-100' : 'bg-orange-50 border-orange-100 animate-pulse'}`}>
+                                    <div className={`w-2 h-2 rounded-full ${wallet ? 'bg-green-500' : 'bg-orange-500'}`} />
+                                    <span className={`text-xs font-mono ${wallet ? 'text-indigo-700' : 'text-orange-700'}`}>
+                                        {effectiveWallet.substring(0, 6)}...{effectiveWallet.substring(38)}
+                                        {!wallet && <span className="ml-2 opacity-60">(Session)</span>}
                                     </span>
                                 </div>
                             ) : (
@@ -104,9 +122,9 @@ function App() {
             </nav>
 
             {/* Role-Based Portals */}
-            {user.role === 'student' && <StudentPortal wallet={wallet} connectWallet={connectWallet} />}
+            {user.role === 'student' && <StudentPortal wallet={effectiveWallet} connectWallet={connectWallet} />}
             {user.role === 'verifier' && <VerifierPortal />}
-            {user.role === 'institution' && <IssuerPortal wallet={wallet} connectWallet={connectWallet} />}
+            {user.role === 'institution' && <IssuerPortal wallet={effectiveWallet} connectWallet={connectWallet} connectedMetaMask={wallet} />}
         </div>
     );
 }
